@@ -1,11 +1,11 @@
 # --------------------------------------------------
-# PAKOLLINEN RENDERIÄ VARTEN
+# PAKOLLINEN RENDERIÄ VARTEN (matplotlib ilman GUI:ta)
 # --------------------------------------------------
 import matplotlib
 matplotlib.use("Agg")
 
 # --------------------------------------------------
-# PERUSIMPORTIT
+# IMPORTIT
 # --------------------------------------------------
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,7 +16,7 @@ import math
 import matplotlib.pyplot as plt
 
 # --------------------------------------------------
-# FASTAPI
+# FASTAPI-APP
 # --------------------------------------------------
 app = FastAPI()
 
@@ -51,48 +51,62 @@ def calculate_total_length(doc):
         nonlocal total_length
         etype = e.dxftype()
 
-        if etype == "LINE":
-            total_length += dist(
-                (e.dxf.start.x, e.dxf.start.y),
-                (e.dxf.end.x, e.dxf.end.y)
-            )
-
-        elif etype == "CIRCLE":
-            total_length += 2 * math.pi * e.dxf.radius
-
-        elif etype == "ARC":
-            total_length += arc_length(
-                e.dxf.radius,
-                e.dxf.start_angle,
-                e.dxf.end_angle
-            )
-
-        elif etype == "LWPOLYLINE":
-            pts = list(e.get_points())
-            for i in range(len(pts) - 1):
+        try:
+            if etype == "LINE":
                 total_length += dist(
-                    (pts[i][0], pts[i][1]),
-                    (pts[i + 1][0], pts[i + 1][1])
-                )
-            if e.closed and len(pts) > 2:
-                total_length += dist(
-                    (pts[-1][0], pts[-1][1]),
-                    (pts[0][0], pts[0][1])
+                    (e.dxf.start.x, e.dxf.start.y),
+                    (e.dxf.end.x, e.dxf.end.y)
                 )
 
-        elif etype == "POLYLINE":
-            pts = [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
-            for i in range(len(pts) - 1):
-                total_length += dist(pts[i], pts[i + 1])
-            if e.is_closed and len(pts) > 2:
-                total_length += dist(pts[-1], pts[0])
+            elif etype == "CIRCLE":
+                total_length += 2 * math.pi * e.dxf.radius
 
-    # MODELSPACE + BLOCKIT
+            elif etype == "ARC":
+                total_length += arc_length(
+                    e.dxf.radius,
+                    e.dxf.start_angle,
+                    e.dxf.end_angle
+                )
+
+            elif etype == "LWPOLYLINE":
+                pts = list(e.get_points())
+                for i in range(len(pts) - 1):
+                    total_length += dist(
+                        (pts[i][0], pts[i][1]),
+                        (pts[i + 1][0], pts[i + 1][1])
+                    )
+                if e.closed and len(pts) > 2:
+                    total_length += dist(
+                        (pts[-1][0], pts[-1][1]),
+                        (pts[0][0], pts[0][1])
+                    )
+
+            elif etype == "POLYLINE":
+                pts = [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
+                for i in range(len(pts) - 1):
+                    total_length += dist(pts[i], pts[i + 1])
+                if e.is_closed and len(pts) > 2:
+                    total_length += dist(pts[-1], pts[0])
+
+            else:
+                # TEXT, HATCH, SPLINE, DIMENSION jne. ohitetaan turvallisesti
+                pass
+
+        except Exception:
+            # Yksittäinen viallinen entity ei kaada koko laskentaa
+            pass
+
+    # --------------------------------------------------
+    # MODELSPACE + BLOCKIT (INSERT)
+    # --------------------------------------------------
     for ent in msp:
         if ent.dxftype() == "INSERT":
-            block = doc.blocks.get(ent.dxf.name)
-            for be in block:
-                handle_entity(be)
+            try:
+                block = doc.blocks.get(ent.dxf.name)
+                for be in block:
+                    handle_entity(be)
+            except Exception:
+                pass
         else:
             handle_entity(ent)
 
@@ -105,8 +119,16 @@ def calculate_total_length(doc):
 @app.post("/parse-dxf")
 async def parse_dxf(file: UploadFile = File(...)):
     try:
+        if not file.filename.lower().endswith(".dxf"):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "File is not a DXF"}
+            )
+
         content = await file.read()
-        doc = ezdxf.read(io.BytesIO(content))
+        stream = io.BytesIO(content)
+
+        doc = ezdxf.read(stream)
         total_length = calculate_total_length(doc)
 
         return {
@@ -131,7 +153,9 @@ async def parse_dxf(file: UploadFile = File(...)):
 async def preview_dxf(file: UploadFile = File(...)):
     try:
         content = await file.read()
-        doc = ezdxf.read(io.BytesIO(content))
+        stream = io.BytesIO(content)
+
+        doc = ezdxf.read(stream)
         msp = doc.modelspace()
 
         fig, ax = plt.subplots()
@@ -141,49 +165,56 @@ async def preview_dxf(file: UploadFile = File(...)):
         def draw_entity(e):
             etype = e.dxftype()
 
-            if etype == "LINE":
-                ax.plot(
-                    [e.dxf.start.x, e.dxf.end.x],
-                    [e.dxf.start.y, e.dxf.end.y],
-                    "k"
-                )
-
-            elif etype == "CIRCLE":
-                ax.add_patch(
-                    plt.Circle(
-                        (e.dxf.center.x, e.dxf.center.y),
-                        e.dxf.radius,
-                        fill=False,
-                        color="black"
+            try:
+                if etype == "LINE":
+                    ax.plot(
+                        [e.dxf.start.x, e.dxf.end.x],
+                        [e.dxf.start.y, e.dxf.end.y],
+                        "k"
                     )
-                )
 
-            elif etype == "ARC":
-                ax.add_patch(
-                    plt.Arc(
-                        (e.dxf.center.x, e.dxf.center.y),
-                        2 * e.dxf.radius,
-                        2 * e.dxf.radius,
-                        theta1=e.dxf.start_angle,
-                        theta2=e.dxf.end_angle,
-                        color="black"
+                elif etype == "CIRCLE":
+                    ax.add_patch(
+                        plt.Circle(
+                            (e.dxf.center.x, e.dxf.center.y),
+                            e.dxf.radius,
+                            fill=False,
+                            color="black"
+                        )
                     )
-                )
 
-            elif etype == "LWPOLYLINE":
-                pts = list(e.get_points())
-                xs = [p[0] for p in pts]
-                ys = [p[1] for p in pts]
-                if e.closed:
-                    xs.append(xs[0])
-                    ys.append(ys[0])
-                ax.plot(xs, ys, "k")
+                elif etype == "ARC":
+                    ax.add_patch(
+                        plt.Arc(
+                            (e.dxf.center.x, e.dxf.center.y),
+                            2 * e.dxf.radius,
+                            2 * e.dxf.radius,
+                            theta1=e.dxf.start_angle,
+                            theta2=e.dxf.end_angle,
+                            color="black"
+                        )
+                    )
+
+                elif etype == "LWPOLYLINE":
+                    pts = list(e.get_points())
+                    xs = [p[0] for p in pts]
+                    ys = [p[1] for p in pts]
+                    if e.closed:
+                        xs.append(xs[0])
+                        ys.append(ys[0])
+                    ax.plot(xs, ys, "k")
+
+            except Exception:
+                pass
 
         for ent in msp:
             if ent.dxftype() == "INSERT":
-                block = doc.blocks.get(ent.dxf.name)
-                for be in block:
-                    draw_entity(be)
+                try:
+                    block = doc.blocks.get(ent.dxf.name)
+                    for be in block:
+                        draw_entity(be)
+                except Exception:
+                    pass
             else:
                 draw_entity(ent)
 
