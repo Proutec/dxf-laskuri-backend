@@ -44,4 +44,3 @@ async def parse_dxf(file: UploadFile = File(...)):
     return {
         "total_length_mm": round(total_length, 2)
     }
-
