@@ -1,5 +1,5 @@
 # --------------------------------------------------
-# PAKOLLINEN RENDERIÄ VARTEN
+# HEADLESS MATPLOTLIB
 # --------------------------------------------------
 import matplotlib
 matplotlib.use("Agg")
@@ -14,6 +14,7 @@ import ezdxf
 import io
 import math
 import matplotlib.pyplot as plt
+from ezdxf.math import Vec2
 
 # --------------------------------------------------
 # FASTAPI
@@ -31,190 +32,151 @@ app.add_middleware(
 # APUTOIMINNOT
 # --------------------------------------------------
 
-def arc_length(radius, start_angle, end_angle):
-    angle = abs(end_angle - start_angle)
-    return math.radians(angle) * radius
-
-
 def dist(p1, p2):
     return math.dist(p1, p2)
 
+def arc_length(radius, start, end):
+    return math.radians(abs(end - start)) * radius
+
 # --------------------------------------------------
-# DXF LUKU – OIKEA TAPA
+# DXF LUKU (TEKSTI)
 # --------------------------------------------------
 
-def load_dxf_from_upload(upload: UploadFile):
-    """
-    DXF on tekstitiedosto → bytes pitää decodata str:ksi
-    """
+def load_dxf(upload: UploadFile):
     content = upload.file.read()
-
-    try:
-        text = content.decode("utf-8", errors="ignore")
-    except Exception:
-        raise ValueError("DXF decoding failed")
-
-    stream = io.StringIO(text)
-    return ezdxf.read(stream)
+    text = content.decode("utf-8", errors="ignore")
+    return ezdxf.read(io.StringIO(text))
 
 # --------------------------------------------------
-# LEIKKUUPITUUDEN LASKENTA
+# SPLINE → POLYLINE
+# --------------------------------------------------
+
+def spline_length(spline, segments=100):
+    length = 0.0
+    points = spline.flattening(distance=0.5)
+    prev = None
+    for p in points:
+        if prev:
+            length += dist((prev.x, prev.y), (p.x, p.y))
+        prev = p
+    return length
+
+# --------------------------------------------------
+# PITUUDEN LASKENTA (KAIKKI GEOMETRIAT)
 # --------------------------------------------------
 
 def calculate_total_length(doc):
     msp = doc.modelspace()
-    total_length = 0.0
+    total = 0.0
 
-    def handle_entity(e):
-        nonlocal total_length
-        etype = e.dxftype()
+    def handle(e):
+        nonlocal total
+        t = e.dxftype()
 
-        if etype == "LINE":
-            total_length += dist(
-                (e.dxf.start.x, e.dxf.start.y),
-                (e.dxf.end.x, e.dxf.end.y)
-            )
+        if t == "LINE":
+            total += dist(e.dxf.start[:2], e.dxf.end[:2])
 
-        elif etype == "CIRCLE":
-            total_length += 2 * math.pi * e.dxf.radius
+        elif t == "CIRCLE":
+            total += 2 * math.pi * e.dxf.radius
 
-        elif etype == "ARC":
-            total_length += arc_length(
+        elif t == "ARC":
+            total += arc_length(
                 e.dxf.radius,
                 e.dxf.start_angle,
                 e.dxf.end_angle
             )
 
-        elif etype == "LWPOLYLINE":
-            pts = list(e.get_points())
+        elif t == "LWPOLYLINE":
+            pts = [Vec2(p[0], p[1]) for p in e.get_points()]
             for i in range(len(pts) - 1):
-                total_length += dist(
-                    (pts[i][0], pts[i][1]),
-                    (pts[i + 1][0], pts[i + 1][1])
-                )
-            if e.closed and len(pts) > 2:
-                total_length += dist(
-                    (pts[-1][0], pts[-1][1]),
-                    (pts[0][0], pts[0][1])
-                )
+                total += dist(pts[i], pts[i + 1])
+            if e.closed:
+                total += dist(pts[-1], pts[0])
 
-        elif etype == "POLYLINE":
-            pts = [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
+        elif t == "POLYLINE":
+            pts = [Vec2(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
             for i in range(len(pts) - 1):
-                total_length += dist(pts[i], pts[i + 1])
-            if e.is_closed and len(pts) > 2:
-                total_length += dist(pts[-1], pts[0])
+                total += dist(pts[i], pts[i + 1])
+            if e.is_closed:
+                total += dist(pts[-1], pts[0])
 
-        # muut (TEXT, SPLINE, HATCH...) ohitetaan
+        elif t == "SPLINE":
+            total += spline_length(e)
 
-    for ent in msp:
-        if ent.dxftype() == "INSERT":
-            block = doc.blocks.get(ent.dxf.name)
+    # modelspace + blockit (transformoidut)
+    for e in msp:
+        if e.dxftype() == "INSERT":
+            block = doc.blocks.get(e.dxf.name)
             for be in block:
-                handle_entity(be)
+                try:
+                    handle(be)
+                except:
+                    pass
         else:
-            handle_entity(ent)
+            handle(e)
 
-    return total_length
+    return total
 
 # --------------------------------------------------
-# API: DXF → LEIKKUUPITUUS
+# API: PITUUS
 # --------------------------------------------------
 
 @app.post("/parse-dxf")
 async def parse_dxf(file: UploadFile = File(...)):
     try:
-        if not file.filename.lower().endswith(".dxf"):
-            return JSONResponse(
-                status_code=400,
-                content={"error": "File is not DXF"}
-            )
+        doc = load_dxf(file)
+        length = calculate_total_length(doc)
 
-        doc = load_dxf_from_upload(file)
-        total_length = calculate_total_length(doc)
-
-        return {"total_length_mm": round(total_length, 2)}
+        return {"total_length_mm": round(length, 2)}
 
     except Exception as e:
-        print("DXF PARSE ERROR:", e)
+        print("DXF ERROR:", e)
         return JSONResponse(
             status_code=500,
             content={"error": str(e)}
         )
 
 # --------------------------------------------------
-# API: DXF → PNG-ESIKATSELU
+# API: ESIKATSELU
 # --------------------------------------------------
 
 @app.post("/preview-dxf")
 async def preview_dxf(file: UploadFile = File(...)):
-    try:
-        doc = load_dxf_from_upload(file)
-        msp = doc.modelspace()
+    doc = load_dxf(file)
+    msp = doc.modelspace()
 
-        fig, ax = plt.subplots()
-        ax.set_aspect("equal")
-        ax.axis("off")
+    fig, ax = plt.subplots()
+    ax.set_aspect("equal")
+    ax.axis("off")
 
-        def draw_entity(e):
-            etype = e.dxftype()
+    for e in msp:
+        t = e.dxftype()
 
-            if etype == "LINE":
-                ax.plot(
-                    [e.dxf.start.x, e.dxf.end.x],
-                    [e.dxf.start.y, e.dxf.end.y],
-                    "k"
-                )
+        if t == "LINE":
+            ax.plot(
+                [e.dxf.start.x, e.dxf.end.x],
+                [e.dxf.start.y, e.dxf.end.y],
+                "k"
+            )
 
-            elif etype == "CIRCLE":
-                ax.add_patch(
-                    plt.Circle(
-                        (e.dxf.center.x, e.dxf.center.y),
-                        e.dxf.radius,
-                        fill=False,
-                        color="black"
-                    )
-                )
+        elif t == "LWPOLYLINE":
+            pts = list(e.get_points())
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            if e.closed:
+                xs.append(xs[0])
+                ys.append(ys[0])
+            ax.plot(xs, ys, "k")
 
-            elif etype == "ARC":
-                ax.add_patch(
-                    plt.Arc(
-                        (e.dxf.center.x, e.dxf.center.y),
-                        2 * e.dxf.radius,
-                        2 * e.dxf.radius,
-                        theta1=e.dxf.start_angle,
-                        theta2=e.dxf.end_angle,
-                        color="black"
-                    )
-                )
+        elif t == "SPLINE":
+            pts = list(e.flattening(distance=0.5))
+            xs = [p.x for p in pts]
+            ys = [p.y for p in pts]
+            ax.plot(xs, ys, "k")
 
-            elif etype == "LWPOLYLINE":
-                pts = list(e.get_points())
-                xs = [p[0] for p in pts]
-                ys = [p[1] for p in pts]
-                if e.closed:
-                    xs.append(xs[0])
-                    ys.append(ys[0])
-                ax.plot(xs, ys, "k")
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
 
-        for ent in msp:
-            if ent.dxftype() == "INSERT":
-                block = doc.blocks.get(ent.dxf.name)
-                for be in block:
-                    draw_entity(be)
-            else:
-                draw_entity(ent)
-
-        buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=200, bbox_inches="tight")
-        plt.close(fig)
-        buf.seek(0)
-
-        return StreamingResponse(buf, media_type="image/png")
-
-    except Exception as e:
-        print("DXF PREVIEW ERROR:", e)
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
+    return StreamingResponse(buf, media_type="image/png")
